@@ -13,7 +13,7 @@ import shutil
 
 def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_checkpoint, model_dir,
           loss_fn, pruning_fn, summary_fn, double_precision=False, clip_grad=False,
-          loss_schedules=None, resume_checkpoint={}, objs_to_save={}, epochs_til_pruning=4):
+          loss_schedules=None, resume_checkpoint={}, objs_to_save={}, epochs_til_pruning=4, no_retile=False):
     optim = torch.optim.Adam(lr=lr, params=model.parameters())
 
     # load optimizer if supplied
@@ -71,6 +71,9 @@ def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_che
                 retile = False
             else:
                 retile = True
+
+            if no_retile:
+                retile = False
 
             for step, (model_input, gt) in enumerate(train_dataloader):
                 start_time = time.time()

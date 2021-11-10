@@ -75,6 +75,13 @@ p.add_argument('--scale_init', type=int, default=3,
 
 p.add_argument('--checkpoint_path', default=None, help='Checkpoint to trained model.')
 p.add_argument('--logging_root', type=str, default='../logs', help='root for logging')
+
+p.add_argument('--split_encoder', action='store_true', default=False)
+p.add_argument('--approx_layers', type=int, default=2)
+p.add_argument('--fusion_size', type=int, default=1)
+p.add_argument('--reduced_fusion', action='store_true', default=False)
+p.add_argument('--resume_tree', type=str, default='')
+p.add_argument('--no_retile', action='store_true', default=False)
 opt = p.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -131,7 +138,11 @@ def main():
                                                  feature_grid_size=(opt.patch_size[0], opt.patch_size[1], opt.patch_size[2]),
                                                  sidelength=opt.res,
                                                  num_encoding_functions=10,
-                                                 patch_size=opt.patch_size[1:])
+                                                 patch_size=opt.patch_size[1:],
+                                                 split_encoder=opt.split_encoder, 
+                                                 approx_layers=opt.approx_layers,
+                                                 fusion_size=opt.fusion_size, 
+                                                 reduced_fusion=opt.reduced_fusion)
 
     elif opt.model_type == 'siren':
         model = modules.ImplicitNet(opt.res, in_features=2,
@@ -192,6 +203,14 @@ def main():
     else:
         resume_checkpoint = {}
 
+    if opt.resume_tree != '':
+        print('Loading checkpoints')
+        optim_dict = torch.load(opt.resume_tree)
+        # initialize model state_dict
+        print('Initializing models')
+        coord_dataset.quadtree.__load__(optim_dict['quadtree'])
+        coord_dataset.synchronize()
+
     if opt.eval:
         run_eval(model, coord_dataset)
     else:
@@ -209,16 +228,16 @@ def main():
         training.train(model=model, train_dataloader=dataloader, epochs=opt.num_epochs, lr=opt.lr,
                        steps_til_summary=opt.steps_til_summary, epochs_til_checkpoint=opt.epochs_til_ckpt,
                        model_dir=root_path, loss_fn=loss_fn, pruning_fn=pruning_fn, summary_fn=summary_fn, objs_to_save=objs_to_save,
-                       resume_checkpoint=resume_checkpoint)
+                       resume_checkpoint=resume_checkpoint, no_retile=opt.no_retile)
 
 
 # evaluate PSNR at saved checkpoints and save model outputs
 def run_eval(model, coord_dataset):
     # get checkpoint directory
-    checkpoint_dir = os.path.join(os.path.dirname(opt.config), 'checkpoints')
+    checkpoint_dir = os.path.join(opt.resume[0], 'checkpoints')
 
     # make eval directory
-    eval_dir = os.path.join(os.path.dirname(opt.config), 'eval')
+    eval_dir = os.path.join(os.path.dirname(opt.resume[0]), 'eval')
     utils.cond_mkdir(eval_dir)
 
     # get model & optim files
@@ -226,11 +245,11 @@ def run_eval(model, coord_dataset):
     optim_files = sorted([f for f in os.listdir(checkpoint_dir) if re.search(r'optim_[0-9]+.pth', f)], reverse=True)
 
     # extract iterations
-    iters = [int(re.search(r'[0-9]+', f)[0]) for f in model_files]
+    iters = [int(re.search(r'[0-9]+', f)[0]) for f in model_files[-1:]]
 
     # append beginning of path
-    model_files = [os.path.join(checkpoint_dir, f) for f in model_files]
-    optim_files = [os.path.join(checkpoint_dir, f) for f in optim_files]
+    model_files = [os.path.join(checkpoint_dir, f) for f in model_files[-1:]]
+    optim_files = [os.path.join(checkpoint_dir, f) for f in optim_files[-1:]]
 
     # iterate through model and optim files
     metrics = {}

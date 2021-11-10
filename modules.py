@@ -4,7 +4,6 @@ import numpy as np
 import math
 from functools import partial
 
-
 class Sine(nn.Module):
     def __init__(self, w0=30):
         super().__init__()
@@ -21,7 +20,7 @@ class FCBlock(nn.Module):
     '''
 
     def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='relu', weight_init=None, w0=30):
+                 outermost_linear=False, nonlinearity='relu', weight_init=None, w0=30, **kwargs):
         super().__init__()
 
         self.first_layer_init = None
@@ -69,7 +68,7 @@ class FCBlock(nn.Module):
 
 class PositionalEncoding(nn.Module):
     def __init__(self, num_encoding_functions=6, include_input=True, log_sampling=True, normalize=False,
-                 input_dim=3, gaussian_pe=False, gaussian_variance=38):
+                 input_dim=3, gaussian_pe=False, gaussian_variance=38, freq_last=False):
         super().__init__()
         self.num_encoding_functions = num_encoding_functions
         self.include_input = include_input
@@ -77,6 +76,7 @@ class PositionalEncoding(nn.Module):
         self.normalize = normalize
         self.gaussian_pe = gaussian_pe
         self.normalization = None
+        self.freq_last = freq_last
 
         if self.gaussian_pe:
             # this needs to be registered as a parameter so that it is saved in the model state dict
@@ -98,6 +98,14 @@ class PositionalEncoding(nn.Module):
 
             if normalize:
                 self.normalization = torch.tensor(1/self.frequency_bands)
+        
+        self.prep_coe()
+
+    def prep_coe(self, device='cuda'):
+        if self.frequency_bands is not None:
+            self.frequency_bands = self.frequency_bands.to(device)
+        if self.normalization is not None:
+            self.normalization = self.normalization.to(device)
 
     def forward(self, tensor) -> torch.Tensor:
         r"""Apply positional encoding to the input.
@@ -114,23 +122,36 @@ class PositionalEncoding(nn.Module):
         """
 
         encoding = [tensor] if self.include_input else []
+        in_dim = tensor.shape[-1]
         if self.gaussian_pe:
             for func in [torch.sin, torch.cos]:
                 encoding.append(func(torch.matmul(tensor, self.gaussian_weights.T)))
         else:
-            for idx, freq in enumerate(self.frequency_bands):
-                for func in [torch.sin, torch.cos]:
-                    if self.normalization is not None:
-                        encoding.append(self.normalization[idx]*func(tensor * freq))
-                    else:
-                        encoding.append(func(tensor * freq))
+            # for idx, freq in enumerate(self.frequency_bands):
+            #     for func in [torch.sin, torch.cos]:
+            #         if self.normalization is not None:
+            #             encoding.append(self.normalization[idx]*func(tensor * freq))
+            #         else:
+            #             encoding.append(func(tensor * freq))
 
+            pos_encoding = tensor.unsqueeze(-2) * \
+                self.frequency_bands.reshape([1]*(len(tensor.shape)-1) + [-1, 1])
+            sin = torch.sin(pos_encoding)
+            cos = torch.cos(pos_encoding)
+            pos_encoding = torch.cat([sin, cos], -1)
+            if self.normalization is not None:
+                pos_encoding = pos_encoding * self.normalization.reshape([1]*(len(tensor.shape)-1) + [-1, 1])
+            pos_encoding = pos_encoding.reshape(list(pos_encoding.shape)[:-2] + [-1])
+            encoding.append(pos_encoding)
         # Special case, for no positional encoding
         if len(encoding) == 1:
             return encoding[0]
         else:
-            return torch.cat(encoding, dim=-1)
-
+            encoding = torch.cat(encoding, dim=-1)
+            if self.freq_last:
+                sh = encoding.shape[:-1]
+                encoding = encoding.reshape(*sh, -1, in_dim).transpose(-1,-2).reshape(*sh, -1)
+            return encoding
 
 def init_weights_normal(m):
     if type(m) == nn.Linear:
@@ -163,7 +184,9 @@ def first_layer_sine_init(m):
 class ImplicitAdaptivePatchNet(nn.Module):
     def __init__(self, in_features=3, out_features=1, feature_grid_size=(8, 8, 8),
                  hidden_features=256, num_hidden_layers=3, patch_size=8,
-                 code_dim=8, use_pe=True, num_encoding_functions=6, **kwargs):
+                 code_dim=8, use_pe=True, num_encoding_functions=6, 
+                 split_encoder=False, approx_layers=2, fusion_size=1, reduced_fusion=False,
+                 **kwargs):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -172,12 +195,15 @@ class ImplicitAdaptivePatchNet(nn.Module):
         self.use_pe = use_pe
 
         if self.use_pe:
-            self.positional_encoding = PositionalEncoding(num_encoding_functions=num_encoding_functions)
+            self.positional_encoding = PositionalEncoding(num_encoding_functions=num_encoding_functions,
+                                            freq_last=split_encoder)
             in_features = 2*in_features*num_encoding_functions + in_features
 
-        self.coord2features_net = FCBlock(in_features=in_features, out_features=np.prod(feature_grid_size),
+        encoder_net = FCBlock if not split_encoder else SplitFCBlock
+        self.coord2features_net = encoder_net(in_features=in_features, out_features=np.prod(feature_grid_size),
                                           num_hidden_layers=num_hidden_layers, hidden_features=hidden_features,
-                                          outermost_linear=True, nonlinearity='relu')
+                                          outermost_linear=True, nonlinearity='relu', coord_dim=self.in_features,
+                                          approx_layers=approx_layers, fusion_size=fusion_size, reduced=reduced_fusion)
 
         self.features2sample_net = FCBlock(in_features=self.feature_grid_size[0], out_features=out_features,
                                            num_hidden_layers=1, hidden_features=64,
@@ -208,9 +234,9 @@ class ImplicitAdaptivePatchNet(nn.Module):
         sample_coords_out = fine_coords[0, ...].reshape(1, -1, 2)
         sample_coords = sample_coords_out.reshape(b_size, self.patch_size[0], self.patch_size[1], 2)
 
-        y = sample_coords[..., :1]
-        x = sample_coords[..., 1:]
-        sample_coords = torch.cat([y, x], dim=-1)
+        # y = sample_coords[..., :1]
+        # x = sample_coords[..., 1:]
+        # sample_coords = torch.cat([y, x], dim=-1)
 
         features_out = torch.nn.functional.grid_sample(features_in, sample_coords,
                                                        mode='bilinear',
@@ -331,3 +357,101 @@ class ImplicitNet(nn.Module):
 
         output = self.net(coords)
         return {'model_in': {'coords': coords}, 'model_out': {'output': output}}
+
+
+class SplitFCBlock(nn.Module):
+    '''A split coordinate MLP blocks for speed boost.
+    '''
+
+    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
+                 outermost_linear=False, nonlinearity='relu', weight_init=None, w0=30,
+                 coord_dim=3, approx_layers=2, fusion_size=1, reduced=False):
+        super().__init__()
+
+        self.first_layer_init = None
+
+        self.coord_dim = coord_dim
+        feat_per_channel = in_features // coord_dim
+        self.feat_per_channel = [feat_per_channel] * coord_dim
+        self.split_channels = len(self.feat_per_channel)
+        self.approx_layers = approx_layers
+        self.fusion_feat_size = hidden_features # Note: no support for fully-split
+        self.fusion_size = fusion_size
+
+        # Dictionary that maps nonlinearity name to the respective function, initialization, and, if applicable,
+        # special first-layer initialization scheme
+        nls_and_inits = {'sine': (Sine(w0=w0), partial(sine_init, w0=w0), first_layer_sine_init),
+                         'relu': (nn.ReLU(inplace=True), init_weights_normal, None)}
+
+        nl, nl_weight_init, first_layer_init = nls_and_inits[nonlinearity]
+
+        if weight_init is not None:  # Overwrite weight init if passed
+            self.weight_init = weight_init
+        else:
+            self.weight_init = nl_weight_init
+
+        s = 1 if reduced else fusion_size
+        self.coord_linears = nn.ModuleList(
+            [nn.Linear(feat, hidden_features*s) for feat in self.feat_per_channel]
+        )
+        self.coord_nl = nl
+
+        if first_layer_init is not None: # Apply special initialization to first layer, if applicable.
+            self.coord_linears.apply(first_layer_init)
+        else:
+            self.coord_linears.apply(self.weight_init)
+
+        self.share_split_layers = []
+        i = -1
+        for i in range(min(approx_layers, num_hidden_layers)-1):
+            self.share_split_layers.append(nn.Sequential(
+                nn.Linear(hidden_features*s, hidden_features*s), nl
+            ))
+        i+=1
+        self.share_split_layers.append(nn.Sequential(
+                nn.Linear(hidden_features*s, hidden_features*fusion_size), nl
+            ))
+        self.share_split_layers = nn.Sequential(*self.share_split_layers)
+
+        self.after_fusion_layers = []
+        for j in range(i+1, num_hidden_layers):
+            self.after_fusion_layers.append(nn.Sequential(
+                nn.Linear(hidden_features, hidden_features), nl
+            ))
+
+        if outermost_linear:
+            self.after_fusion_layers.append(nn.Sequential(nn.Linear(hidden_features, out_features)))
+        else:
+            self.after_fusion_layers.append(nn.Sequential(
+                nn.Linear(hidden_features, out_features), nl
+            ))
+
+        self.after_fusion_layers = nn.Sequential(*self.after_fusion_layers)
+        if self.weight_init is not None:
+            self.share_split_layers.apply(self.weight_init)
+            self.after_fusion_layers.apply(self.weight_init)
+
+    def forward(self, coords, split_coord=False):
+        """
+        When split_coord=True, the input coords should be a list a tensor for each coord.
+        the length of each coord tensor do not need to be the same. But the dimension of each coord tensor
+        should be predefined for broadcasting operation.
+        """
+        hs = torch.split(coords, self.feat_per_channel, dim=-1)
+        coord_h = []
+        for i, hi in enumerate(hs):
+            h = self.coord_linears[i](hi)
+            coord_h.append(h)
+        hs = torch.stack(coord_h, -2)
+        hs = self.coord_nl(hs)
+
+        hs = self.share_split_layers(hs)
+        # product fusion
+        h = hs.prod(-2)
+        if self.fusion_size > 1:
+            h_sh = h.shape
+            h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+
+        output = self.after_fusion_layers(h)
+
+        return output

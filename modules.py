@@ -185,7 +185,7 @@ class ImplicitAdaptivePatchNet(nn.Module):
     def __init__(self, in_features=3, out_features=1, feature_grid_size=(8, 8, 8),
                  hidden_features=256, num_hidden_layers=3, patch_size=8,
                  code_dim=8, use_pe=True, num_encoding_functions=6, 
-                 split_encoder=False, approx_layers=2, fusion_size=1, reduced_fusion=False,
+                 split_encoder=False, approx_layers=2, fusion_size=1, reduced_fusion=False, split_rule=None,
                  **kwargs):
         super().__init__()
         self.in_features = in_features
@@ -193,6 +193,9 @@ class ImplicitAdaptivePatchNet(nn.Module):
         self.feature_grid_size = feature_grid_size
         self.patch_size = patch_size
         self.use_pe = use_pe
+        self.split_rule = split_rule
+        if self.split_rule is None:
+            self.split_rule = [1] * in_features
 
         if self.use_pe:
             self.positional_encoding = PositionalEncoding(num_encoding_functions=num_encoding_functions,
@@ -203,7 +206,8 @@ class ImplicitAdaptivePatchNet(nn.Module):
         self.coord2features_net = encoder_net(in_features=in_features, out_features=np.prod(feature_grid_size),
                                           num_hidden_layers=num_hidden_layers, hidden_features=hidden_features,
                                           outermost_linear=True, nonlinearity='relu', coord_dim=self.in_features,
-                                          approx_layers=approx_layers, fusion_size=fusion_size, reduced=reduced_fusion)
+                                          approx_layers=approx_layers, fusion_size=fusion_size, reduced=reduced_fusion,
+                                          split_rule=split_rule)
 
         self.features2sample_net = FCBlock(in_features=self.feature_grid_size[0], out_features=out_features,
                                            num_hidden_layers=1, hidden_features=64,
@@ -216,22 +220,39 @@ class ImplicitAdaptivePatchNet(nn.Module):
         coords = model_input['coords'].clone().detach().requires_grad_(True)
         fine_coords = model_input['fine_rel_coords'].clone().detach().requires_grad_(True)
 
-        if self.use_pe:
-            coords = self.positional_encoding(coords)
+        features = self.get_features(coords)
 
-        features = self.coord2features_net(coords)
+        sample_coords_out = fine_coords[0, ...].reshape(1, -1, 2)
+        
+        patch_out = self.get_pred(features, sample_coords_out)        
 
-        # features is size (Batch Size, Blocks, prod(feature_grid_size))
-        # but currently interpolate bilinear only supports one batch dimension,
-        # therefore, for now assume that Batch Size == 1
-        assert features.shape[0] == 1, 'Code currently only supports Batch Size == 1'
+        return {'model_in': {'sample_coords_out': sample_coords_out, 'model_in_coarse': coords},
+                'model_out': {'output': patch_out, 'codes': None}}
+
+    def get_features(self, coords, split=False):
+        if not split:
+            if self.use_pe:
+                coords = self.positional_encoding(coords)
+
+            features = self.coord2features_net(coords)
+
+            # features is size (Batch Size, Blocks, prod(feature_grid_size))
+            # but currently interpolate bilinear only supports one batch dimension,
+            # therefore, for now assume that Batch Size == 1
+            assert features.shape[0] == 1, 'Code currently only supports Batch Size == 1'
+        else:
+            features = self.get_features_split(coords)
+
+        return features
+
+    def get_pred(self, features, sample_coords_out):
 
         n_channels, dx, dy = self.feature_grid_size
         features = features.squeeze(0)
         b_size = features.shape[0]
 
         features_in = features.squeeze().reshape(b_size, n_channels, dx, dy)
-        sample_coords_out = fine_coords[0, ...].reshape(1, -1, 2)
+
         sample_coords = sample_coords_out.reshape(b_size, self.patch_size[0], self.patch_size[1], 2)
 
         # y = sample_coords[..., :1]
@@ -253,8 +274,17 @@ class ImplicitAdaptivePatchNet(nn.Module):
         # squeeze out last dimension and restore batch dimension
         patch_out = patch_out.unsqueeze(0)
 
-        return {'model_in': {'sample_coords_out': sample_coords_out, 'model_in_coarse': coords},
-                'model_out': {'output': patch_out, 'codes': None}}
+        return patch_out
+
+    def get_features_split(self, coords):
+        # coords here should be unique collections
+
+        unique_coords = []
+        for u_coords in coords['u_coords']:
+            u_coords = self.positional_encoding(u_coords) if self.use_pe else u_coords
+            unique_coords.append(u_coords)
+
+        return self.coord2features_net(unique_coords, coords['index'])
 
 
 class ImplicitAdaptiveOctantNet(nn.Module):
@@ -365,18 +395,22 @@ class SplitFCBlock(nn.Module):
 
     def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
                  outermost_linear=False, nonlinearity='relu', weight_init=None, w0=30,
-                 coord_dim=3, approx_layers=2, fusion_size=1, reduced=False):
+                 coord_dim=3, approx_layers=2, fusion_size=1, reduced=False, split_rule=None):
         super().__init__()
 
         self.first_layer_init = None
 
         self.coord_dim = coord_dim
         feat_per_channel = in_features // coord_dim
-        self.feat_per_channel = [feat_per_channel] * coord_dim
+        if split_rule is None:
+            self.feat_per_channel = [feat_per_channel] * coord_dim
+        else:
+            self.feat_per_channel = [feat_per_channel * k for k in split_rule]
         self.split_channels = len(self.feat_per_channel)
         self.approx_layers = approx_layers
         self.fusion_feat_size = hidden_features # Note: no support for fully-split
         self.fusion_size = fusion_size
+        self.split_infer = False
 
         # Dictionary that maps nonlinearity name to the respective function, initialization, and, if applicable,
         # special first-layer initialization scheme
@@ -431,23 +465,52 @@ class SplitFCBlock(nn.Module):
             self.share_split_layers.apply(self.weight_init)
             self.after_fusion_layers.apply(self.weight_init)
 
-    def forward(self, coords, split_coord=False):
+    def forward(self, coords, index=None):
         """
         When split_coord=True, the input coords should be a list a tensor for each coord.
         the length of each coord tensor do not need to be the same. But the dimension of each coord tensor
         should be predefined for broadcasting operation.
         """
-        hs = torch.split(coords, self.feat_per_channel, dim=-1)
+        if index is not None:
+            return self.split_forward(coords, index)
+        else:
+            hs = torch.split(coords, self.feat_per_channel, dim=-1)
+            coord_h = []
+            for i, hi in enumerate(hs):
+                h = self.coord_linears[i](hi)
+                coord_h.append(h)
+            hs = torch.stack(coord_h, -2)
+            hs = self.coord_nl(hs)
+
+            hs = self.share_split_layers(hs)
+            # product fusion
+            h = hs.prod(-2)
+            if self.fusion_size > 1:
+                h_sh = h.shape
+                h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+
+            output = self.after_fusion_layers(h)
+
+            return output
+
+    def split_forward(self, coords, index):
+        '''
+        coords in split mode should be a list of tensors
+
+        '''
         coord_h = []
-        for i, hi in enumerate(hs):
+        channel_len = []
+        for i, hi in enumerate(coords):
             h = self.coord_linears[i](hi)
             coord_h.append(h)
-        hs = torch.stack(coord_h, -2)
+            channel_len.append(hi.shape[-2])
+        hs = torch.cat(coord_h, -2)
         hs = self.coord_nl(hs)
-
         hs = self.share_split_layers(hs)
-        # product fusion
-        h = hs.prod(-2)
+        
+        # broadcast based on index
+        hs = torch.split(hs, channel_len, dim=-2)
+        h = torch.stack([hs[i][..., index[i], :] for i in range(len(index))]).prod(0)
         if self.fusion_size > 1:
             h_sh = h.shape
             h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)

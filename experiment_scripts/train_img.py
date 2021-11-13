@@ -82,6 +82,8 @@ p.add_argument('--fusion_size', type=int, default=1)
 p.add_argument('--reduced_fusion', action='store_true', default=False)
 p.add_argument('--resume_tree', type=str, default='')
 p.add_argument('--no_retile', action='store_true', default=False)
+p.add_argument('--split_infer', action='store_true', default=False)
+p.add_argument('--merge_scale', action='store_true', default=False)
 opt = p.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -110,7 +112,9 @@ def main():
                                                             sidelength=opt.res,
                                                             patch_size=opt.patch_size[1:], jitter=True,
                                                             num_workers=opt.num_workers, length=opt.steps_til_tiling,
-                                                            scale_init=opt.scale_init, max_patches=opt.max_patches)
+                                                            scale_init=opt.scale_init, max_patches=opt.max_patches,
+                                                            merge_scale=opt.merge_scale
+                                                            )
 
     opt.num_epochs = opt.num_iters // coord_dataset.__len__()
 
@@ -132,7 +136,8 @@ def main():
         out_features = 3
 
     if opt.model_type == 'multiscale':
-        model = modules.ImplicitAdaptivePatchNet(in_features=3, out_features=out_features,
+        model = modules.ImplicitAdaptivePatchNet(in_features=3 if not opt.merge_scale else 4, 
+                                                 out_features=out_features,
                                                  num_hidden_layers=opt.hidden_layers,
                                                  hidden_features=opt.hidden_features,
                                                  feature_grid_size=(opt.patch_size[0], opt.patch_size[1], opt.patch_size[2]),
@@ -142,7 +147,9 @@ def main():
                                                  split_encoder=opt.split_encoder, 
                                                  approx_layers=opt.approx_layers,
                                                  fusion_size=opt.fusion_size, 
-                                                 reduced_fusion=opt.reduced_fusion)
+                                                 reduced_fusion=opt.reduced_fusion,
+                                                 split_rule=[2,2] if opt.merge_scale else None
+                                                 )
 
     elif opt.model_type == 'siren':
         model = modules.ImplicitNet(opt.res, in_features=2,
@@ -232,7 +239,7 @@ def main():
 
 
 # evaluate PSNR at saved checkpoints and save model outputs
-def run_eval(model, coord_dataset):
+def run_eval(model, coord_dataset, load_seq=False, timing=True):
     # get checkpoint directory
     checkpoint_dir = os.path.join(opt.resume[0], 'checkpoints')
 
@@ -245,27 +252,27 @@ def run_eval(model, coord_dataset):
     optim_files = sorted([f for f in os.listdir(checkpoint_dir) if re.search(r'optim_[0-9]+.pth', f)], reverse=True)
 
     # extract iterations
-    iters = [int(re.search(r'[0-9]+', f)[0]) for f in model_files[-1:]]
+    iters = [int(re.search(r'[0-9]+', f)[0]) for f in model_files]
 
     # append beginning of path
-    model_files = [os.path.join(checkpoint_dir, f) for f in model_files[-1:]]
-    optim_files = [os.path.join(checkpoint_dir, f) for f in optim_files[-1:]]
+    model_files = [os.path.join(checkpoint_dir, f) for f in model_files]
+    optim_files = [os.path.join(checkpoint_dir, f) for f in optim_files]
 
     # iterate through model and optim files
     metrics = {}
     saved_gt = False
     for curr_iter, model_path, optim_path in zip(tqdm(iters), model_files, optim_files):
+        if load_seq:
+            # load model and optimizer files
+            print(f'Loading models {model_path}')
+            model_dict = torch.load(model_path)
+            optim_dict = torch.load(optim_path)
 
-        # load model and optimizer files
-        print('Loading models')
-        model_dict = torch.load(model_path)
-        optim_dict = torch.load(optim_path)
-
-        # initialize model state_dict
-        print('Initializing models')
-        model.load_state_dict(model_dict)
-        coord_dataset.quadtree.__load__(optim_dict['quadtree'])
-        coord_dataset.synchronize()
+            # initialize model state_dict
+            print('Initializing models')
+            model.load_state_dict(model_dict)
+            coord_dataset.quadtree.__load__(optim_dict['quadtree'])
+            coord_dataset.synchronize()
 
         # save image and calculate psnr
         coord_dataset.toggle_eval()
@@ -292,11 +299,21 @@ def run_eval(model, coord_dataset):
         # run the model on uniform samples
         print('Running forward pass')
         n_channels = gt['img'].shape[-1]
-        start = time()
+        
+        num_runs = 1
+        encoder_only = False
         with torch.no_grad():
-            pred_img = utils.process_batch_in_chunks(model_input, model, max_chunk_size=512)['model_out']['output']
-        torch.cuda.synchronize()
-        print(f'Model: {time() - start:.02f}')
+            utils.coord_preprocess(model_input, split=opt.split_infer, model=model)
+            start = time()
+            for k in range(num_runs):
+                # pred_img = utils.process_batch_in_chunks(model_input, model, max_chunk_size=512)['model_out']['output']
+                pred_img = utils.process_batch_in_chunks_faster(model_input, model, max_chunk_size=1024, 
+                                            split=opt.split_infer, encoder_only=encoder_only)['model_out']['output']
+                f"{pred_img[...,0]}"
+            print(f'Model Time: {(time() - start)/num_runs:.03f}')
+    
+        # if not load_seq:
+        #     return
 
         # get pixel idx for each coordinate
         start = time()
@@ -352,6 +369,9 @@ def run_eval(model, coord_dataset):
         # save metrics
         metric_fname = os.path.join(eval_dir, f'metrics_{curr_iter:06d}.npy')
         np.save(metric_fname, metrics)
+
+        if not load_seq:
+            break
 
 
 def get_metrics(pred_img, gt_img):

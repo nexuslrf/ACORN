@@ -237,6 +237,54 @@ def process_batch_in_chunks(in_dict, model, max_chunk_size=1024, progress=None):
     return {'model_in': batched_in, 'model_out': batched_out}
 
 
+def coord_preprocess(in_dict, split=False, model=None):
+
+    unique_coords, indices = in_dict['coords'].unique_consecutive(dim=1, return_inverse=True)
+    del in_dict['coords']
+    in_dict['unique_coords'] = unique_coords.cuda()
+    in_dict['indices'] = indices
+    if split:
+        offset = 0
+        in_dict['split_coords'] = {
+            'u_coords': [], 'index': []
+        }
+        for i in model.split_rule:
+            u_coords, index = in_dict['unique_coords'][..., offset:offset+i].unique(dim=-2, return_inverse=True)
+            in_dict['split_coords']['u_coords'].append(u_coords)
+            in_dict['split_coords']['index'].append(index)
+            offset+=1
+
+def process_batch_in_chunks_faster(in_dict, model, max_chunk_size=1024, split=False, encoder_only=False, progress=None):
+
+    indices = in_dict['indices']
+    if not split:
+        unique_features = model.get_features(in_dict['unique_coords'], split=split)
+    else:
+        unique_features = model.get_features(in_dict['split_coords'], split=split)
+
+    if encoder_only:
+        return {'model_out': {'output': unique_features }}
+
+    data_len = len(indices)
+    list_chunked_batched_out_out = []
+
+    for i in range(0, data_len, max_chunk_size):
+        chunk_batched_in = {
+            'features': unique_features[:, indices[i:i+max_chunk_size]],
+            'sample_coords_out': in_dict['fine_rel_coords'][:, i:i+max_chunk_size].cuda().reshape(1,-1,2)
+        }
+        patch_out = model.get_pred(**chunk_batched_in).cpu()
+        list_chunked_batched_out_out.append(patch_out)
+
+        del chunk_batched_in
+
+    # Reassemble the output chunks in a batch
+    batched_out = {
+        'output': torch.cat(list_chunked_batched_out_out, 1)
+        }
+
+    return {'model_in': None, 'model_out': batched_out}
+
 def subsample_dict(in_dict, num_views, multiscale=False):
     if multiscale:
         out = {}

@@ -243,12 +243,13 @@ class ImageFile(Dataset):
 
 class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
     def __init__(self, dataset, patch_size=(16, 16), sidelength=None, random_coords=False,
-                 jitter=True, num_workers=0, length=1000, scale_init=3, max_patches=1024):
+                 jitter=True, num_workers=0, length=1000, scale_init=3, max_patches=1024, merge_scale=False):
 
         self.length = length
         if len(sidelength) == 1:
             sidelength = 2*sidelength
         self.sidelength = sidelength
+        self.merge_scale = merge_scale
 
         for i in range(2):
             assert float(sidelength[i]) / float(patch_size[i]) % 1 == 0, 'Resolution not divisible by patch size'
@@ -355,7 +356,10 @@ class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
         coords = torch.stack([p.block_coord for p in patches], dim=0)
         scales = torch.stack([torch.tensor(p.scale) for p in patches], dim=0)[:, None]
         scales = 2*scales // (self.num_scales-1) - 1
-        coords = torch.cat((coords, scales), dim=-1)
+        if not self.merge_scale:
+            coords = torch.cat((coords, scales), dim=-1)
+        else:
+            coords = torch.cat((coords[...,0,None], scales, coords[...,1,None], scales), dim=-1)
 
         if self.eval:
             coords = coords[coord_patch_idx]

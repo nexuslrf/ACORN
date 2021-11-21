@@ -76,6 +76,7 @@ def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_che
                 retile = False
 
             for step, (model_input, gt) in enumerate(train_dataloader):
+                # print(model_input['fine_rel_coords'].shape)
                 start_time = time.time()
 
                 tmp = {}
@@ -98,7 +99,10 @@ def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_che
                     model_input = {key: value.double() for key, value in model_input.items()}
                     gt = {key: value.double() for key, value in gt.items()}
 
+                model.features2sample_net.toggle_broadcast()
                 model_output = model(model_input)
+                model.features2sample_net.toggle_broadcast()
+
                 losses = loss_fn(model_output, gt, total_steps, retile=retile)
 
                 train_loss = 0.
@@ -130,7 +134,8 @@ def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_che
 
                 if not total_steps % steps_til_summary:
                     tqdm.write("Epoch %d, Total loss %0.6f, iteration time %0.6f" % (epoch, train_loss, time.time() - start_time))
-                    summary_fn(model, model_input, gt, model_output, writer, total_steps)
+                    with torch.no_grad():
+                        summary_fn(model, model_input, gt, model_output, writer, total_steps)
 
                 total_steps += 1
 

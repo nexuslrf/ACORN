@@ -299,19 +299,27 @@ class QuadTree():
         return torch.cat(rel_coords, dim=0), torch.cat(abs_coords, dim=0), \
             torch.cat(vals, dim=0), patch_idx
 
-    def get_stratified_samples(self, jitter=True, eval=False):
+    def get_stratified_samples(self, jitter=True, eval=False, sample_ratio=1, sidx=0):
         patches = self.get_active_patches()
 
         rel_coords, abs_coords = [], []
         patch_idx = []
-
+        x_s, y_s = (self.min_patch_size * self.aspect_ratio).astype(int)
+        f_s = int(x_s * y_s * sample_ratio)
         for idx, p in enumerate(patches):
-            rel_samp, abs_samp = p.get_stratified_samples(jitter=jitter, eval=eval)
+            rel_samp, abs_samp = p.get_stratified_samples(jitter=jitter, eval=eval, sample_ratio=sample_ratio, idx=sidx)
 
             # always batch the coordinates in groups of a specific patch size
             # so we can process them in parallel
-            rel_samp = rel_samp.reshape(-1, int(np.prod(self.min_patch_size * self.aspect_ratio)), 2)
-            abs_samp = abs_samp.reshape(-1, int(np.prod(self.min_patch_size * self.aspect_ratio)), 2)
+            fully_split = False
+            if eval and fully_split:
+                mp_s = p.pixel_size // x_s
+                rel_samp = rel_samp.reshape(mp_s, x_s, mp_s, y_s, 2).permute(0,2,1,3,4).reshape(-1, f_s, 2)
+                abs_samp = abs_samp.reshape(mp_s, x_s, mp_s, y_s, 2).permute(0,2,1,3,4).reshape(-1, f_s, 2)
+            else:
+                rel_samp = rel_samp.reshape(-1, f_s, 2)
+                abs_samp = abs_samp.reshape(-1, f_s, 2)
+
 
             # since patch samples could be split across batches,
             # keep track of which batch idx maps to which patch idx
@@ -661,7 +669,7 @@ class Patch():
         self.err = error
         self.last_updated = iter
 
-    def get_stratified_samples(self, jitter=True, eval=False):
+    def get_stratified_samples(self, jitter=True, eval=False, sample_ratio=1, idx=0):
         # Block coords are always aligned to the pixel grid,
         # e.g., they align with pixels 0, 8, 16, 24, etc. for
         # patch size 8
@@ -700,15 +708,23 @@ class Patch():
         # between the arrows above
         #
         if eval:
-            row_coords = self.eval_row_coords.flatten()
-            col_coords = self.eval_col_coords.flatten()
+            n = len(self.eval_col_coords)
+            slice_len = int(n * sample_ratio)
+            n_slice = (n-1) // slice_len + 1
+            idx = idx % n_slice
+            row_coords = self.eval_row_coords.flatten()[idx*slice_len:(idx+1)*slice_len]
+            col_coords = self.eval_col_coords.flatten()[idx*slice_len:(idx+1)*slice_len]
         else:
             row_coords = self.row_coords
             col_coords = self.col_coords
-
+            if sample_ratio < 1:
+                c_len = len(row_coords)
+                rand_id = torch.randperm(c_len)[:int(c_len*sample_ratio)]
+                row_coords = row_coords[rand_id]
+                col_coords = col_coords[rand_id]
             if jitter:
-                row_coords = self.row_coords + torch.rand_like(self.row_coords) * 2./self.num_samples[0]
-                col_coords = self.col_coords + torch.rand_like(self.col_coords) * 2./self.num_samples[1]
+                row_coords = row_coords + torch.rand_like(row_coords) * 2./self.num_samples[0]
+                col_coords = col_coords + torch.rand_like(col_coords) * 2./self.num_samples[1]
 
         rel_samples = torch.stack((row_coords, col_coords), dim=-1)
         abs_samples = self.block_coord[None, :] + self.block_size[None, :] * (rel_samples+1)/2

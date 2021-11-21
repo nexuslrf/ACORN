@@ -117,6 +117,8 @@ def write_image_patch_multiscale_summary(image_resolution, patch_size, dataset, 
     # run the model on uniform samples
     n_channels = gt['img'].shape[-1]
     pred_img = process_batch_in_chunks(model_input, model)['model_out']['output']
+    # coord_preprocess(model_input, split=model.split_encoder, model=model)
+    # pred_img = process_batch_in_chunks_faster(model_input, model, split=model.split_encoder, max_chunk_size=512)['model_out']['output']
 
     # get pixel idx for each coordinate
     coords = model_input['fine_abs_coords'].detach().cpu().numpy()
@@ -241,18 +243,21 @@ def coord_preprocess(in_dict, split=False, model=None):
 
     unique_coords, indices = in_dict['coords'].unique_consecutive(dim=1, return_inverse=True)
     del in_dict['coords']
-    in_dict['unique_coords'] = unique_coords.cuda()
+    in_dict['unique_coords'] = unique_coords.contiguous().cuda()
     in_dict['indices'] = indices
     if split:
-        offset = 0
+        offset = 0 
         in_dict['split_coords'] = {
             'u_coords': [], 'index': []
         }
         for i in model.split_rule:
             u_coords, index = in_dict['unique_coords'][..., offset:offset+i].unique(dim=-2, return_inverse=True)
-            in_dict['split_coords']['u_coords'].append(u_coords)
+            in_dict['split_coords']['u_coords'].append(u_coords.contiguous())
             in_dict['split_coords']['index'].append(index)
             offset+=1
+        if model.fully_split:
+            u_fine_coords = in_dict['fine_rel_coords'].reshape(-1, *model.feature_grid_size[-2:], 2)
+            in_dict['u_fine_coords'] = [u_fine_coords[:, :, :1, 0], u_fine_coords[:, :1, :, 1]]
 
 def process_batch_in_chunks_faster(in_dict, model, max_chunk_size=1024, split=False, encoder_only=False, progress=None):
 
@@ -270,8 +275,11 @@ def process_batch_in_chunks_faster(in_dict, model, max_chunk_size=1024, split=Fa
 
     for i in range(0, data_len, max_chunk_size):
         chunk_batched_in = {
-            'features': unique_features[:, indices[i:i+max_chunk_size]],
-            'sample_coords_out': in_dict['fine_rel_coords'][:, i:i+max_chunk_size].cuda().reshape(1,-1,2)
+            'features': unique_features[..., indices[i:i+max_chunk_size], :],
+            'sample_coords_out': in_dict['fine_rel_coords'][:, i:i+max_chunk_size].cuda().reshape(1,-1,2),
+            'u_fine_coords': 
+                [coord_i[i:i+max_chunk_size].cuda() for coord_i in in_dict['u_fine_coords']] \
+                    if 'u_fine_coords' in in_dict else None
         }
         patch_out = model.get_pred(**chunk_batched_in).cpu()
         list_chunked_batched_out_out.append(patch_out)

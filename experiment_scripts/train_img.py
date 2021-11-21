@@ -84,6 +84,8 @@ p.add_argument('--resume_tree', type=str, default='')
 p.add_argument('--no_retile', action='store_true', default=False)
 p.add_argument('--split_infer', action='store_true', default=False)
 p.add_argument('--merge_scale', action='store_true', default=False)
+p.add_argument('--split_decoder', action='store_true', default=False)
+p.add_argument('--sample_ratio', type=float, default=1.0)
 opt = p.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -113,7 +115,8 @@ def main():
                                                             patch_size=opt.patch_size[1:], jitter=True,
                                                             num_workers=opt.num_workers, length=opt.steps_til_tiling,
                                                             scale_init=opt.scale_init, max_patches=opt.max_patches,
-                                                            merge_scale=opt.merge_scale
+                                                            merge_scale=opt.merge_scale,
+                                                            sample_ratio=opt.sample_ratio
                                                             )
 
     opt.num_epochs = opt.num_iters // coord_dataset.__len__()
@@ -148,7 +151,8 @@ def main():
                                                  approx_layers=opt.approx_layers,
                                                  fusion_size=opt.fusion_size, 
                                                  reduced_fusion=opt.reduced_fusion,
-                                                 split_rule=[2,2] if opt.merge_scale else None
+                                                 split_rule=[2,2] if opt.merge_scale else None,
+                                                 split_decoder=opt.split_decoder
                                                  )
 
     elif opt.model_type == 'siren':
@@ -185,7 +189,7 @@ def main():
                          pruning_every=1)
 
     # if we are resuming from a saved checkpoint
-    if opt.resume is not None:
+    if opt.resume is not None and opt.resume_tree=='':
         print('Loading checkpoints')
         model_dict = torch.load(path + '/checkpoints/' + f'model_{iter:06d}.pth')
         model.load_state_dict(model_dict)
@@ -259,24 +263,28 @@ def run_eval(model, coord_dataset, load_seq=False, timing=True):
     optim_files = [os.path.join(checkpoint_dir, f) for f in optim_files]
 
     # iterate through model and optim files
+    se = 0
+    counts = 0
     metrics = {}
     saved_gt = False
-    for curr_iter, model_path, optim_path in zip(tqdm(iters), model_files, optim_files):
-        if load_seq:
-            # load model and optimizer files
-            print(f'Loading models {model_path}')
-            model_dict = torch.load(model_path)
-            optim_dict = torch.load(optim_path)
+    # for curr_iter, model_path, optim_path in zip(tqdm(iters), model_files, optim_files):
+    #     if load_seq:
+    #         # load model and optimizer files
+    #         print(f'Loading models {model_path}')
+    #         model_dict = torch.load(model_path)
+    #         optim_dict = torch.load(optim_path)
 
-            # initialize model state_dict
-            print('Initializing models')
-            model.load_state_dict(model_dict)
-            coord_dataset.quadtree.__load__(optim_dict['quadtree'])
-            coord_dataset.synchronize()
-
+    #         # initialize model state_dict
+    #         print('Initializing models')
+    #         model.load_state_dict(model_dict)
+    #         coord_dataset.quadtree.__load__(optim_dict['quadtree'])
+    #         # coord_dataset.sample_ratio = 0.5
+    #         coord_dataset.synchronize()
+    for i in tqdm(range(1)):
+        print('Getting data...')
         # save image and calculate psnr
         coord_dataset.toggle_eval()
-        model_input, gt = coord_dataset[0]
+        model_input, gt = coord_dataset[i]
         coord_dataset.toggle_eval()
 
         # convert to cuda and add batch dimension
@@ -300,8 +308,8 @@ def run_eval(model, coord_dataset, load_seq=False, timing=True):
         print('Running forward pass')
         n_channels = gt['img'].shape[-1]
         
-        num_runs = 1
-        encoder_only = False
+        num_runs = 20
+        encoder_only = True #True
         with torch.no_grad():
             utils.coord_preprocess(model_input, split=opt.split_infer, model=model)
             start = time()
@@ -311,67 +319,72 @@ def run_eval(model, coord_dataset, load_seq=False, timing=True):
                                             split=opt.split_infer, encoder_only=encoder_only)['model_out']['output']
                 f"{pred_img[...,0]}"
             print(f'Model Time: {(time() - start)/num_runs:.03f}')
-    
+
+        se += ((0.5*(pred_img.cuda().clip(-1,1) - gt['img'].cuda()))**2).sum().cpu().item()
+        counts += pred_img.numel()//3
+        print(se, counts)
         # if not load_seq:
         #     return
-
+        
         # get pixel idx for each coordinate
-        start = time()
-        coords = model_input['fine_abs_coords'].detach().cpu().numpy()
-        pixel_idx = np.zeros_like(coords).astype(np.int32)
-        pixel_idx[..., 0] = np.round((coords[..., 0] + 1.)/2. * (coord_dataset.sidelength[0]-1)).astype(np.int32)
-        pixel_idx[..., 1] = np.round((coords[..., 1] + 1.)/2. * (coord_dataset.sidelength[1]-1)).astype(np.int32)
-        pixel_idx = pixel_idx.reshape(-1, 2)
+        # start = time()
+        # coords = model_input['fine_abs_coords'].detach().cpu().numpy()
+        # pixel_idx = np.zeros_like(coords).astype(np.int32)
+        # pixel_idx[..., 0] = np.round((coords[..., 0] + 1.)/2. * (coord_dataset.sidelength[0]-1)).astype(np.int32)
+        # pixel_idx[..., 1] = np.round((coords[..., 1] + 1.)/2. * (coord_dataset.sidelength[1]-1)).astype(np.int32)
+        # pixel_idx = pixel_idx.reshape(-1, 2)
 
-        # assign predicted image values into a new array
-        # need to use numpy since it supports index assignment
-        pred_img = pred_img.detach().cpu().numpy().reshape(-1, n_channels)
-        display_pred = np.zeros((*coord_dataset.sidelength, n_channels))
-        display_pred[[pixel_idx[:, 0]], [pixel_idx[:, 1]]] = pred_img
-        display_pred = torch.tensor(display_pred)[None, ...]
-        display_pred = display_pred.permute(0, 3, 1, 2)
+        # # assign predicted image values into a new array
+        # # need to use numpy since it supports index assignment
+        # pred_img = pred_img.detach().cpu().numpy().reshape(-1, n_channels)
+        # display_pred = np.zeros((*coord_dataset.sidelength, n_channels))
+        # display_pred[[pixel_idx[:, 0]], [pixel_idx[:, 1]]] = pred_img
+        # display_pred = torch.tensor(display_pred)[None, ...]
+        # display_pred = display_pred.permute(0, 3, 1, 2)
 
-        if not saved_gt:
-            gt_img = gt['img'].detach().cpu().numpy().reshape(-1, n_channels)
-            display_gt = np.zeros((*coord_dataset.sidelength, n_channels))
-            display_gt[[pixel_idx[:, 0]], [pixel_idx[:, 1]]] = gt_img
-            display_gt = torch.tensor(display_gt)[None, ...]
-            display_gt = display_gt.permute(0, 3, 1, 2)
-        print(f'Reshape: {time() - start:.02f}')
+        # if not saved_gt:
+        #     gt_img = gt['img'].detach().cpu().numpy().reshape(-1, n_channels)
+        #     display_gt = np.zeros((*coord_dataset.sidelength, n_channels))
+        #     display_gt[[pixel_idx[:, 0]], [pixel_idx[:, 1]]] = gt_img
+        #     display_gt = torch.tensor(display_gt)[None, ...]
+        #     display_gt = display_gt.permute(0, 3, 1, 2)
+        # print(f'Reshape: {time() - start:.02f}')
 
-        # record metrics
-        start = time()
-        psnr, ssim = get_metrics(display_pred, display_gt)
-        metrics.update({curr_iter: {'psnr': psnr, 'ssim': ssim}})
-        print(f'Metrics: {time() - start:.02f}')
-        print(f'Iter: {curr_iter}, PSNR: {psnr:.02f}')
+        # # record metrics
+        # start = time()
+        # psnr, ssim = get_metrics(display_pred, display_gt)
+        # metrics.update({curr_iter: {'psnr': psnr, 'ssim': ssim}})
+        # print(f'Metrics: {time() - start:.02f}')
+        # print(f'Iter: {curr_iter}, PSNR: {psnr:.02f}')
 
+        # return
+        
         # save images
-        pred_out = np.clip((display_pred.squeeze().numpy()/2.) + 0.5, a_min=0., a_max=1.).transpose(1, 2, 0)*255
-        pred_out = pred_out.astype(np.uint8)
-        pred_fname = os.path.join(eval_dir, f'pred_{curr_iter:06d}.png')
-        print('Saving image')
-        cv2.imwrite(pred_fname, cv2.cvtColor(pred_out, cv2.COLOR_RGB2BGR))
+        # pred_out = np.clip((display_pred.squeeze().numpy()/2.) + 0.5, a_min=0., a_max=1.).transpose(1, 2, 0)*255
+        # pred_out = pred_out.astype(np.uint8)
+        # pred_fname = os.path.join(eval_dir, f'pred_{curr_iter:06d}.png')
+        # print('Saving image')
+        # cv2.imwrite(pred_fname, cv2.cvtColor(pred_out, cv2.COLOR_RGB2BGR))
 
-        if not saved_gt:
-            print('Saving gt')
-            gt_out = np.clip((display_gt.squeeze().numpy()/2.) + 0.5, a_min=0., a_max=1.).transpose(1, 2, 0)*255
-            gt_out = gt_out.astype(np.uint8)
-            gt_fname = os.path.join(eval_dir, 'gt.png')
-            cv2.imwrite(gt_fname, cv2.cvtColor(gt_out, cv2.COLOR_RGB2BGR))
-            saved_gt = True
+        # if not saved_gt:
+        #     print('Saving gt')
+        #     gt_out = np.clip((display_gt.squeeze().numpy()/2.) + 0.5, a_min=0., a_max=1.).transpose(1, 2, 0)*255
+        #     gt_out = gt_out.astype(np.uint8)
+        #     gt_fname = os.path.join(eval_dir, 'gt.png')
+        #     cv2.imwrite(gt_fname, cv2.cvtColor(gt_out, cv2.COLOR_RGB2BGR))
+        #     saved_gt = True
 
-        # save tiling
-        tiling_fname = os.path.join(eval_dir, f'tiling_{curr_iter:06d}.pdf')
-        coord_dataset.quadtree.draw()
-        plt.savefig(tiling_fname)
+        # # save tiling
+        # tiling_fname = os.path.join(eval_dir, f'tiling_{curr_iter:06d}.pdf')
+        # coord_dataset.quadtree.draw()
+        # plt.savefig(tiling_fname)
 
-        # save metrics
-        metric_fname = os.path.join(eval_dir, f'metrics_{curr_iter:06d}.npy')
-        np.save(metric_fname, metrics)
+        # # save metrics
+        # metric_fname = os.path.join(eval_dir, f'metrics_{curr_iter:06d}.npy')
+        # np.save(metric_fname, metrics)
 
-        if not load_seq:
-            break
+        # if not load_seq:
+        #     break
 
 
 def get_metrics(pred_img, gt_img):

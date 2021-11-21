@@ -243,13 +243,14 @@ class ImageFile(Dataset):
 
 class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
     def __init__(self, dataset, patch_size=(16, 16), sidelength=None, random_coords=False,
-                 jitter=True, num_workers=0, length=1000, scale_init=3, max_patches=1024, merge_scale=False):
+                 jitter=True, num_workers=0, length=1000, scale_init=3, max_patches=1024, merge_scale=False, sample_ratio=1):
 
         self.length = length
         if len(sidelength) == 1:
             sidelength = 2*sidelength
         self.sidelength = sidelength
         self.merge_scale = merge_scale
+        self.sample_ratio = sample_ratio
 
         for i in range(2):
             assert float(sidelength[i]) / float(patch_size[i]) % 1 == 0, 'Resolution not divisible by patch size'
@@ -303,7 +304,7 @@ class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
     def interpolate_bilinear(self, img, fine_abs_coords, psize):
         n_blocks = fine_abs_coords.shape[0]
         n_channels = img.shape[0]
-        fine_abs_coords = fine_abs_coords.reshape(n_blocks, psize[0], psize[1], 2)
+        fine_abs_coords = fine_abs_coords.reshape(n_blocks, 1, -1, 2)
         x = fine_abs_coords[..., :1]
         y = fine_abs_coords[..., 1:]
         coords = torch.cat([y, x], dim=-1)
@@ -317,7 +318,7 @@ class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
             out.append(tmp)
         out = torch.cat(out, dim=0)
         out = out.permute(0, 2, 3, 1)
-        return out.reshape(n_blocks, np.prod(psize), n_channels)
+        return out.reshape(n_blocks, -1, n_channels)
 
     def synchronize(self):
         self.last_active_patches = self.quadtree.get_active_patches()
@@ -349,7 +350,8 @@ class Patch2DWrapperMultiscaleAdaptive(torch.utils.data.Dataset):
             quadtree = self.quadtrees[worker_idx]
 
         # get fine coords
-        fine_rel_coords, fine_abs_coords, coord_patch_idx = quadtree.get_stratified_samples(self.jitter, eval=self.eval)
+        fine_rel_coords, fine_abs_coords, coord_patch_idx = \
+            quadtree.get_stratified_samples(self.jitter, eval=self.eval, sample_ratio=self.sample_ratio, sidx=idx)
 
         # get block coords
         patches = quadtree.get_active_patches()

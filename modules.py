@@ -3,6 +3,7 @@ from torch import nn
 import numpy as np
 import math
 from functools import partial
+# from thirdparty.grid_sample1d.grid_sample1d import GridSample1d
 
 class Sine(nn.Module):
     def __init__(self, w0=30):
@@ -64,6 +65,9 @@ class FCBlock(nn.Module):
     def forward(self, coords):
         output = self.net(coords)
         return output
+
+    def toggle_broadcast(self):
+        pass
 
 
 class PositionalEncoding(nn.Module):
@@ -185,7 +189,8 @@ class ImplicitAdaptivePatchNet(nn.Module):
     def __init__(self, in_features=3, out_features=1, feature_grid_size=(8, 8, 8),
                  hidden_features=256, num_hidden_layers=3, patch_size=8,
                  code_dim=8, use_pe=True, num_encoding_functions=6, 
-                 split_encoder=False, approx_layers=2, fusion_size=1, reduced_fusion=False, split_rule=None,
+                 split_encoder=False, approx_layers=3, fusion_size=1, reduced_fusion=False, 
+                 split_rule=None, split_decoder=False,
                  **kwargs):
         super().__init__()
         self.in_features = in_features
@@ -194,8 +199,12 @@ class ImplicitAdaptivePatchNet(nn.Module):
         self.patch_size = patch_size
         self.use_pe = use_pe
         self.split_rule = split_rule
+        self.fully_split = approx_layers > num_hidden_layers
+        self.split_decoder = split_decoder
+        self.split_encoder = split_encoder
+        self.fusion_size = fusion_size
         if self.split_rule is None:
-            self.split_rule = [1] * in_features
+            self.split_rule = [1] * in_features if split_encoder else [1]
 
         if self.use_pe:
             self.positional_encoding = PositionalEncoding(num_encoding_functions=num_encoding_functions,
@@ -203,15 +212,24 @@ class ImplicitAdaptivePatchNet(nn.Module):
             in_features = 2*in_features*num_encoding_functions + in_features
 
         encoder_net = FCBlock if not split_encoder else SplitFCBlock
-        self.coord2features_net = encoder_net(in_features=in_features, out_features=np.prod(feature_grid_size),
-                                          num_hidden_layers=num_hidden_layers, hidden_features=hidden_features,
-                                          outermost_linear=True, nonlinearity='relu', coord_dim=self.in_features,
-                                          approx_layers=approx_layers, fusion_size=fusion_size, reduced=reduced_fusion,
-                                          split_rule=split_rule)
+        self.coord2features_net = encoder_net(in_features=in_features, 
+                                out_features=np.prod(feature_grid_size) if not self.fully_split else np.prod(feature_grid_size[:2]),
+                                num_hidden_layers=num_hidden_layers, hidden_features=hidden_features,
+                                outermost_linear=True, nonlinearity='relu', coord_dim=self.in_features,
+                                approx_layers=approx_layers, fusion_size=fusion_size, reduced=reduced_fusion,
+                                split_rule=split_rule)
 
-        self.features2sample_net = FCBlock(in_features=self.feature_grid_size[0], out_features=out_features,
+        decoder_net = FCBlock if not split_decoder else SplitFCBlock
+        self.features2sample_net = decoder_net(
+                                            in_features=self.feature_grid_size[0] if not split_decoder else
+                                                        self.feature_grid_size[0] * fusion_size * len(self.split_rule), 
+                                           out_features=out_features,
                                            num_hidden_layers=1, hidden_features=64,
-                                           outermost_linear=True, nonlinearity='relu')
+                                           outermost_linear=True, nonlinearity='relu', reduced=True,
+                                           approx_layers=1, split_rule=[1,1], coord_dim=2, fusion_size=1)
+        if self.fully_split:
+            # True for border padding, False for zero padding
+            self.grid_sample1d = None #GridSample1d(padding_mode=True, align_corners=True)
         print(self)
 
     def forward(self, model_input):
@@ -224,7 +242,8 @@ class ImplicitAdaptivePatchNet(nn.Module):
 
         sample_coords_out = fine_coords[0, ...].reshape(1, -1, 2)
         
-        patch_out = self.get_pred(features, sample_coords_out)        
+        patch_out = self.get_pred(features, sample_coords_out, 
+                        model_input['u_fine_coords'] if 'u_fine_coords' in model_input else None)        
 
         return {'model_in': {'sample_coords_out': sample_coords_out, 'model_in_coarse': coords},
                 'model_out': {'output': patch_out, 'codes': None}}
@@ -245,7 +264,9 @@ class ImplicitAdaptivePatchNet(nn.Module):
 
         return features
 
-    def get_pred(self, features, sample_coords_out):
+    def get_pred(self, features, sample_coords_out, u_fine_coords=None):
+        if self.fully_split:
+            return self.get_pred_split(features, sample_coords_out, u_fine_coords)
 
         n_channels, dx, dy = self.feature_grid_size
         features = features.squeeze(0)
@@ -253,7 +274,7 @@ class ImplicitAdaptivePatchNet(nn.Module):
 
         features_in = features.squeeze().reshape(b_size, n_channels, dx, dy)
 
-        sample_coords = sample_coords_out.reshape(b_size, self.patch_size[0], self.patch_size[1], 2)
+        sample_coords = sample_coords_out.reshape(b_size, 1,-1, 2)
 
         # y = sample_coords[..., :1]
         # x = sample_coords[..., 1:]
@@ -262,7 +283,7 @@ class ImplicitAdaptivePatchNet(nn.Module):
         features_out = torch.nn.functional.grid_sample(features_in, sample_coords,
                                                        mode='bilinear',
                                                        padding_mode='border',
-                                                       align_corners=True).reshape(b_size, n_channels, np.prod(self.patch_size))
+                                                       align_corners=True).reshape(b_size, n_channels, -1)
 
         # permute from (Blocks, feature_grid_size[0], patch_size**2)->(Blocks, patch_size**2, feature_grid_size[0])
         # so the network maps features to function output
@@ -286,6 +307,32 @@ class ImplicitAdaptivePatchNet(nn.Module):
 
         return self.coord2features_net(unique_coords, coords['index'])
 
+    def get_pred_split(self, features, sample_coords_out, u_fine_coords=None):
+        n_channels, dx, dy = self.feature_grid_size
+        assert dx == dy
+        features = features.squeeze(0)
+        b_size = features.shape[1]
+
+        features_in = features.squeeze().reshape(2, b_size, -1, dx) # -1: n_channel x fusion_size
+
+        if u_fine_coords is None:
+            sample_coords = sample_coords_out.reshape(b_size, -1, 2)
+            features_out = [self.grid_sample1d(features_in[i], sample_coords[...,i].contiguous())\
+                        .permute(0, 2, 1).reshape(*sample_coords.shape[:2], -1)    for i in range(2)] 
+        else:
+            features_out = [self.grid_sample1d(features_in[i], u_fine_coords[i].squeeze().contiguous())\
+                        .permute(0, 2, 1).reshape(*u_fine_coords[i].shape[:3], -1)    for i in range(2)] 
+
+        if not self.split_decoder:
+            features_out = (features_out[0] * features_out[1]).reshape(b_size, -1, n_channels, self.fusion_size).sum(-1)
+        
+        # for all spatial feature vectors, extract function value
+        patch_out = self.features2sample_net(features_out)
+
+        # squeeze out last dimension and restore batch dimension
+        patch_out = patch_out.reshape(1, b_size, -1, 3)
+
+        return patch_out
 
 class ImplicitAdaptiveOctantNet(nn.Module):
     def __init__(self, in_features=4, out_features=1, feature_grid_size=(4, 16, 16, 16),
@@ -411,6 +458,11 @@ class SplitFCBlock(nn.Module):
         self.fusion_feat_size = hidden_features # Note: no support for fully-split
         self.fusion_size = fusion_size
         self.split_infer = False
+        self.broadcast = True
+        self.fully_split = approx_layers > num_hidden_layers
+        if self.fully_split:
+            out_features = out_features * fusion_size
+            self.fusion_size = 1
 
         # Dictionary that maps nonlinearity name to the respective function, initialization, and, if applicable,
         # special first-layer initialization scheme
@@ -424,7 +476,7 @@ class SplitFCBlock(nn.Module):
         else:
             self.weight_init = nl_weight_init
 
-        s = 1 if reduced else fusion_size
+        s = 1 if reduced else self.fusion_size
         self.coord_linears = nn.ModuleList(
             [nn.Linear(feat, hidden_features*s) for feat in self.feat_per_channel]
         )
@@ -443,7 +495,7 @@ class SplitFCBlock(nn.Module):
             ))
         i+=1
         self.share_split_layers.append(nn.Sequential(
-                nn.Linear(hidden_features*s, hidden_features*fusion_size), nl
+                nn.Linear(hidden_features*s, hidden_features*self.fusion_size), nl
             ))
         self.share_split_layers = nn.Sequential(*self.share_split_layers)
 
@@ -473,30 +525,33 @@ class SplitFCBlock(nn.Module):
         """
         if index is not None:
             return self.split_forward(coords, index)
+        elif isinstance(coords, list):
+            return self.split_forward_ni(coords)
         else:
             hs = torch.split(coords, self.feat_per_channel, dim=-1)
             coord_h = []
             for i, hi in enumerate(hs):
                 h = self.coord_linears[i](hi)
                 coord_h.append(h)
-            hs = torch.stack(coord_h, -2)
+            hs = torch.stack(coord_h, 1)
             hs = self.coord_nl(hs)
 
             hs = self.share_split_layers(hs)
-            # product fusion
-            h = hs.prod(-2)
-            if self.fusion_size > 1:
-                h_sh = h.shape
-                h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+            
+            if not self.fully_split:
+                # product fusion
+                hs = hs.prod(1)
+                if self.fusion_size > 1:
+                    h_sh = hs.shape
+                    hs = hs.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
 
-            output = self.after_fusion_layers(h)
+            output = self.after_fusion_layers(hs)
 
             return output
 
     def split_forward(self, coords, index):
         '''
         coords in split mode should be a list of tensors
-
         '''
         coord_h = []
         channel_len = []
@@ -510,11 +565,45 @@ class SplitFCBlock(nn.Module):
         
         # broadcast based on index
         hs = torch.split(hs, channel_len, dim=-2)
-        h = torch.stack([hs[i][..., index[i], :] for i in range(len(index))]).prod(0)
-        if self.fusion_size > 1:
-            h_sh = h.shape
-            h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+        if not self.fully_split:
+            h = torch.stack([hs[i][..., index[i], :] for i in range(len(index))]).prod(0)
+            if self.fusion_size > 1:
+                h_sh = h.shape
+                h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+        else:
+            h = torch.stack([hs[i][..., index[i], :] for i in range(len(index))], dim=1)
 
         output = self.after_fusion_layers(h)
 
         return output
+
+    def split_forward_ni(self, coords):
+        '''
+        coords in split mode should be a list of tensors
+        '''
+        coord_h = []
+        channel_len = []
+        for i, hi in enumerate(coords):
+            h = self.coord_linears[i](hi.squeeze())
+            coord_h.append(h)
+            channel_len.append(hi.shape[-2])
+        hs = torch.stack(coord_h)
+        hs = self.coord_nl(hs)
+        hs = self.share_split_layers(hs)
+        
+        # broadcast based on index
+        if not self.fully_split:
+            h = hs[0].unsqueeze(-2) * hs[1].unsqueeze(-3) if self.broadcast else hs[0] * hs[1]
+            if self.fusion_size > 1:
+                h_sh = h.shape
+                h = h.reshape(*h_sh[:-1], self.fusion_feat_size, -1).sum(-1)
+        else:
+            # h = torch.stack([hs[i][..., index[i], :] for i in range(len(index))], dim=1)
+            pass
+
+        output = self.after_fusion_layers(h)
+
+        return output
+
+    def toggle_broadcast(self):
+        self.broadcast = not self.broadcast
